@@ -2,6 +2,9 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 
+import crypto from "crypto";
+import Razorpay from "razorpay";
+
 dotenv.config();
 
 const app = express();
@@ -122,6 +125,48 @@ Challenge: ${formData.challenge}
   }
 });
 
+////////PAYMENT ENDPOINT (TEST)
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
+});
+app.post("/create-order", async (req, res) => {
+  try {
+    const options = {
+      amount: 9900, // ₹99 in paise
+      currency: "INR",
+      receipt: "order_rcptid_11"
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    res.json(order);
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.post("/verify-payment", (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+  const body = razorpay_order_id + "|" + razorpay_payment_id;
+
+  const expectedSignature = crypto
+    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+    .update(body.toString())
+    .digest("hex");
+
+  if (expectedSignature === razorpay_signature) {
+    // ✅ PAYMENT VERIFIED
+
+    // 🔥 Upgrade user to PRO in Firestore
+    // updateDoc(userRef, { plan: "pro_monthly" })
+
+    res.json({ success: true });
+  } else {
+    res.status(400).json({ success: false });
+  }
+});
 app.listen(5000, () => {
   console.log("🚀 Server running on http://localhost:5000");
 });
