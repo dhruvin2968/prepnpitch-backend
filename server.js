@@ -17,7 +17,8 @@ app.post("/generate", async (req, res) => {
 
     // 🔥 Strong prompt (forces structured JSON)
     const prompt = `
-You are an expert interview coach.
+You are an expert interview coach helping developers sound sharp and confident in technical interviews.
+
 
 STRICT INSTRUCTIONS:
 - Return ONLY valid JSON
@@ -35,13 +36,16 @@ FORMAT EXACTLY LIKE THIS:
   "challengesAndSolutions": "string",
   "interviewQA": [
     { "q": "string", "a": "string" },
+    { "q": "string", "a": "string" },
+    { "q": "string", "a": "string" },
     { "q": "string", "a": "string" }
   ]
 }
+YOUR TONE: Sound like a senior engineer explaining their work — specific, confident, grounded. NOT like a student describing a homework project.
 
 RULES:
 - Make answers detailed and strong (like a top candidate)
-- Elevator pitch: 3 to 4 lines
+- Elevator pitch : 3 to 4 lines. Must use the most impressive concrete numbers from the description. If the user mentioned specific numbers, use them.
 - Detailed explanation: structured, clear, professional
 - Tech justification: explain WHY each tech
 - Challenges: real depth, not generic
@@ -49,7 +53,18 @@ RULES:
 - Write in FIRST PERSON (I built, I used)
 - Make it interview-ready
 - Keep sections SEPARATE (DO NOT merge)
-
+- Return ONLY valid JSON. Zero markdown. Zero backticks. Zero text outside the JSON.
+- ONLY use information the user explicitly provided. Never invent tools, techniques, or outcomes not mentioned.
+- Never use filler: "seamless experience", "robust solution", "wide range", "cutting-edge", "leveraged".
+- Tech justification: one specific reason per technology — WHY this tech for THIS project, not generic praise.
+- Challenges: problem → why it was hard → specific approach → outcome. All in one flowing paragraph.
+- Interview answers: show engineering thinking, not just what you built.
+- interviewQA must ONLY cover topics the user explicitly mentioned. Never invent topics just to fill the quota.
+- Every single claim in every answer must be traceable to something in the project input. If you cannot trace it, do not include it.
+FINAL CHECK before outputting:
+- Did I use the word "seamless"? If yes, rewrite that sentence rephrasing the sentence.
+- Generate between 3 or 4 questions, only on topics explicitly mentioned in the input.
+- Is every tech justification specific to THIS project's actual problem, not generic praise? If not, rewrite.
 Project:
 Name: ${formData.projectName}
 Tech Stack: ${formData.techStack}
@@ -67,6 +82,8 @@ Challenge: ${formData.challenge}
       },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
+        temperature: 0.4,  // add this
+        max_tokens: 1550,
         messages: [{ role: "user", content: prompt }]
       })
     });
@@ -126,6 +143,19 @@ Challenge: ${formData.challenge}
 });
 
 ////////PAYMENT ENDPOINT (TEST)
+// app.post("/create-qr", async (req, res) => {
+//   const qr = await razorpay.qrCode.create({
+//     type: "upi_qr",
+//     name: "Explain My Project",
+//     usage: "single_use",
+//     fixed_amount: true,
+//     payment_amount: 9900, // ₹99 in paise
+//     description: "Pro Plan",
+//     close_by: Math.floor(Date.now() / 1000) + 900 // expires in 15 min
+//   });
+//   res.json({ image_url: qr.image_url, qr_id: qr.id });
+// });
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET
