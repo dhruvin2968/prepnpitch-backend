@@ -197,6 +197,174 @@ app.post("/verify-payment", (req, res) => {
     res.status(400).json({ success: false });
   }
 });
+
+
+///////////////////RESUME PARSING ENDPOINT////////////////////
+app.post("/parse-resume", async (req, res) => {
+  const { resumeText, jobRole } = req.body;
+ 
+  if (!resumeText || resumeText.length < 100) {
+    return res.status(400).json({ error: "Resume text is too short or missing." });
+  }
+ 
+  const roleContext = jobRole
+    ? `The candidate is targeting the role: "${jobRole}". Factor this into keyword gap analysis.`
+    : "No specific target role provided. Do a general analysis.";
+ 
+  const prompt = `
+You are an expert ATS resume analyzer and career coach.
+ 
+${roleContext}
+ 
+Analyze the resume below and return ONLY a valid JSON object — no markdown, no explanation, no backticks.
+ 
+The JSON must follow this exact shape:
+{
+  "atsScore": <number 0-100>,
+  "keywordScore": <number 0-100>,
+  "impactScore": <number 0-100>,
+  "formatScore": <number 0-100>,
+  "overallFeedback": "<2-3 sentence honest assessment of the resume>",
+  "keywordGaps": ["<missing keyword>", "<missing keyword>"],
+  "weakBullets": [
+    {
+      "original": "<the weak bullet point as written>",
+      "rewrite": "<stronger version with action verb, metric, impact>"
+    }
+  ]
+}
+ 
+Scoring guide:
+- atsScore: How well will this pass ATS filters? Check for standard section headers, no tables/columns, parseable format.
+- keywordScore: Does it contain relevant technical and domain keywords for the role?
+- impactScore: Do bullet points quantify achievements? Avoid "responsible for", "worked on", "helped with".
+- formatScore: Is length appropriate (1 page for <5 yrs exp), consistent formatting, no fluff?
+ 
+Return up to 5 weak bullets. Be specific and honest. Return 5-10 keyword gaps.
+ 
+Resume:
+${resumeText.slice(0, 6000)}
+`;
+ 
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    model: "llama-3.3-70b-versatile",
+    temperature: 0.3,
+    max_tokens: 1500,
+    messages: [{ role: "user", content: prompt }],
+  })
+});
+
+const completion = await response.json();
+const raw = completion.choices[0]?.message?.content || "";
+const clean = raw.replace(/```json|```/g, "").trim();
+const data = JSON.parse(clean);
+
+return res.json(data);
+ 
+ 
+  } catch (err) {
+    console.error("Resume analysis error:", err);
+ 
+    // If JSON parse failed, return a helpful error
+    if (err instanceof SyntaxError) {
+      return res.status(500).json({ error: "AI returned invalid response. Try again." });
+    }
+    return res.status(500).json({ error: "Analysis failed. Please try again." });
+  }
+});
+
+
+////////////////Job Match Endpoint (SAME AS RESUME PARSE, JUST DIFFERENT PROMPT)////////////////////
+app.post("/job-match", async (req, res) => {
+  // FIX 1: Expect jobDescription instead of jobRole
+  const { resumeText, jobDescription } = req.body;
+
+  if (!resumeText || resumeText.length < 100) {
+    return res.status(400).json({ error: "Resume text is too short or missing." });
+  }
+
+  // Update context to use the full Job Description
+  const roleContext = jobDescription
+    ? `Compare this resume against the following Job Description: \n"${jobDescription}"`
+    : "No specific job description provided. Do a general analysis.";
+
+  // FIX 2: Update the prompt to output exactly what your React UI wants
+  const prompt = `
+You are an expert ATS resume analyzer and career coach.
+
+${roleContext}
+
+Analyze the resume below against the job description and return ONLY a valid JSON object — no markdown, no explanation, no backticks.
+
+The JSON must follow this exact shape:
+{
+  "overallMatch": <number 0-100>,
+  "skillsMatch": <number 0-100>,
+  "experienceMatch": <number 0-100>,
+  "keywordCoverage": <number 0-100>,
+  "roleAlignment": <number 0-100>,
+  "summary": "<2-3 sentence honest assessment of the match>",
+  "matchedSkills": ["<skill 1>", "<skill 2>"],
+  "missingSkills": ["<missing skill 1>", "<missing skill 2>"],
+  "prepPlan": [
+    {
+      "topic": "<topic to study>",
+      "reason": "<why it matters for this role>",
+      "hours": <estimated hours to learn, e.g. 5>
+    }
+  ]
+}
+
+Return up to 5 matched skills, up to 5 missing skills, and up to 3 prep plan tasks. Be honest and specific.
+
+Resume:
+${resumeText.slice(0, 6000)}
+`;
+
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.3,
+        max_tokens: 1500,
+        messages: [{ role: "user", content: prompt }],
+      })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      console.error("Groq API Error:", errorData);
+      return res.status(response.status).json({ error: "Upstream API error during analysis." });
+    }
+
+    const completion = await response.json();
+    const raw   = completion.choices[0]?.message?.content || "";
+    const clean = raw.replace(/```json|```/g, "").trim(); 
+    const data  = JSON.parse(clean);
+
+    return res.json(data);
+
+  } catch (err) {
+    console.error("Resume analysis error:", err);
+    if (err instanceof SyntaxError) {
+      return res.status(500).json({ error: "AI returned invalid response format. Try again." });
+    }
+    return res.status(500).json({ error: "Analysis failed. Please try again." });
+  }
+});
+
 app.listen(5000, () => {
   console.log("🚀 Server running on http://localhost:5000");
 });
