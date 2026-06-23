@@ -1,17 +1,44 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-
 import crypto from "crypto";
 import Razorpay from "razorpay";
+import rateLimit from "express-rate-limit";
+import { initializeApp, cert } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
 
 dotenv.config();
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// ─── Firebase Admin (for upgrading user after payment) ────────────────────────
+let adminDb = null;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+  initializeApp({ credential: cert(serviceAccount) });
+  adminDb = getFirestore();
+} catch (e) {
+  console.warn("Firebase Admin not configured — Firestore upgrades disabled:", e.message);
+}
 
-app.post("/generate", async (req, res) => {
+const app = express();
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173").split(",");
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow server-to-server (no origin) and whitelisted domains
+    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o.trim()))) return cb(null, true);
+    cb(new Error("CORS: origin not allowed"));
+  },
+  methods: ["GET", "POST"],
+}));
+
+app.use(express.json({ limit: "1mb" }));
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+const aiLimit = rateLimit({ windowMs: 60_000, max: 10, message: { error: "Too many requests. Please wait a minute." } });
+const paymentLimit = rateLimit({ windowMs: 60_000, max: 5, message: { error: "Too many payment requests." } });
+
+app.post("/generate", aiLimit, async (req, res) => {
   try {
     const { formData } = req.body;
 
@@ -89,7 +116,6 @@ Challenge: ${formData.challenge}
     });
 
     const rawText = await response.text();
-    console.log("RAW RESPONSE:", rawText);
 
     // 🔥 Parse Groq response safely
     let apiData;
@@ -142,65 +168,70 @@ Challenge: ${formData.challenge}
   }
 });
 
-////////PAYMENT ENDPOINT (TEST)
-// app.post("/create-qr", async (req, res) => {
-//   const qr = await razorpay.qrCode.create({
-//     type: "upi_qr",
-//     name: "Explain My Project",
-//     usage: "single_use",
-//     fixed_amount: true,
-//     payment_amount: 9900, // ₹99 in paise
-//     description: "Pro Plan",
-//     close_by: Math.floor(Date.now() / 1000) + 900 // expires in 15 min
-//   });
-//   res.json({ image_url: qr.image_url, qr_id: qr.id });
-// });
+// ────────────────────────────────────────────────────────────────────────────
+function getRazorpay() {
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    throw new Error("Razorpay keys not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env");
+  }
+  return new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+}
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
-app.post("/create-order", async (req, res) => {
+app.post("/create-order", paymentLimit, async (req, res) => {
   try {
-    const options = {
-      amount: 9900, // ₹99 in paise
+    const { amount, planId } = req.body;
+    if (!amount || typeof amount !== "number" || amount < 100) {
+      return res.status(400).json({ error: "Invalid amount." });
+    }
+    const order = await getRazorpay().orders.create({
+      amount,
       currency: "INR",
-      receipt: "order_rcptid_11"
-    };
-
-    const order = await razorpay.orders.create(options);
-
+      receipt: `order_${planId}_${Date.now()}`,
+    });
     res.json(order);
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/verify-payment", (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
-  const body = razorpay_order_id + "|" + razorpay_payment_id;
+app.post("/verify-payment", paymentLimit, async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, uid } = req.body;
+
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ success: false, error: "Missing payment fields." });
+  }
 
   const expectedSignature = crypto
     .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(body.toString())
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
     .digest("hex");
 
-  if (expectedSignature === razorpay_signature) {
-    // ✅ PAYMENT VERIFIED
-
-    // 🔥 Upgrade user to PRO in Firestore
-    // updateDoc(userRef, { plan: "pro_monthly" })
-
-    res.json({ success: true });
-  } else {
-    res.status(400).json({ success: false });
+  if (expectedSignature !== razorpay_signature) {
+    return res.status(400).json({ success: false, error: "Payment verification failed." });
   }
+
+  // Upgrade user in Firestore if Admin SDK is available
+  if (adminDb && uid) {
+    try {
+      await adminDb.collection("users").doc(uid).update({
+        plan: planId || "pro_monthly",
+        credits: 999999,
+        upgradedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("Firestore upgrade failed:", err.message);
+      // Payment is verified — don't fail the response, but log it
+    }
+  }
+
+  res.json({ success: true });
 });
 
 
 ///////////////////RESUME PARSING ENDPOINT////////////////////
-app.post("/parse-resume", async (req, res) => {
+app.post("/parse-resume", aiLimit, async (req, res) => {
   const { resumeText, jobRole } = req.body;
  
   if (!resumeText || resumeText.length < 100) {
@@ -282,7 +313,7 @@ return res.json(data);
 
 
 ////////////////Job Match Endpoint (SAME AS RESUME PARSE, JUST DIFFERENT PROMPT)////////////////////
-app.post("/job-match", async (req, res) => {
+app.post("/job-match", aiLimit, async (req, res) => {
   // FIX 1: Expect jobDescription instead of jobRole
   const { resumeText, jobDescription } = req.body;
 
@@ -365,6 +396,7 @@ ${resumeText.slice(0, 6000)}
   }
 });
 
-app.listen(5000, () => {
-  console.log("🚀 Server running on http://localhost:5000");
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
