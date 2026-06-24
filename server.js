@@ -94,6 +94,7 @@ app.use(cors({
   methods: ["GET", "POST"],
 }));
 
+app.set("trust proxy", 1); // Required for rate-limiter behind Render/Vercel proxies
 app.use(express.json({ limit: "1mb" }));
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
