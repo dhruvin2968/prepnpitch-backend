@@ -6,6 +6,7 @@ import Razorpay from "razorpay";
 import rateLimit from "express-rate-limit";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
 
 dotenv.config();
 
@@ -17,6 +18,67 @@ try {
   adminDb = getFirestore();
 } catch (e) {
   console.warn("Firebase Admin not configured — Firestore upgrades disabled:", e.message);
+}
+
+// ─── Free tier monthly quotas ──────────────────────────────────────────────────
+const FREE_LIMITS = { generate: 3, resumeCheck: 3, jobMatch: 2 };
+
+// Returns uid from a Firebase ID token, or null if missing/invalid
+async function verifyToken(req) {
+  const header = req.headers.authorization || "";
+  const token  = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return null;
+
+  // Full verification when Firebase Admin is available
+  if (adminDb) {
+    try {
+      const decoded = await getAuth().verifyIdToken(token);
+      return decoded.uid;
+    } catch {
+      return null;
+    }
+  }
+
+  // Fallback: decode JWT payload without signature verification
+  // (acceptable when Admin SDK is not configured — e.g. local dev)
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+    return payload.user_id || payload.sub || null;
+  } catch {
+    return null;
+  }
+}
+
+// Atomically checks monthly quota and increments the counter.
+// Throws { status: 429, message } when a free user is over their limit.
+async function checkQuota(uid, action) {
+  if (!adminDb || !uid) return; // no Firebase or unauthenticated — rate-limiter is the fallback
+  const ref = adminDb.collection("users").doc(uid);
+  let limitExceeded = false;
+
+  await adminDb.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.data() || {};
+
+    // Pro users: unlimited
+    if (data.plan && data.plan !== "free") return;
+
+    const month = new Date().toISOString().slice(0, 7); // "YYYY-MM"
+    const prev  = (data.usage?.month === month) ? (data.usage || {}) : {};
+    const used  = prev[action] || 0;
+
+    if (used >= FREE_LIMITS[action]) { limitExceeded = true; return; }
+
+    tx.set(ref, { usage: { ...prev, month, [action]: used + 1 } }, { merge: true });
+  });
+
+  if (limitExceeded) {
+    const err = new Error(
+      `Free tier limit reached — ${FREE_LIMITS[action]}/${FREE_LIMITS[action]} uses this month. Upgrade to Pro for unlimited access.`
+    );
+    err.status = 429;
+    throw err;
+  }
 }
 
 const app = express();
@@ -40,6 +102,9 @@ const paymentLimit = rateLimit({ windowMs: 60_000, max: 5, message: { error: "To
 
 app.post("/generate", aiLimit, async (req, res) => {
   try {
+    const uid = await verifyToken(req);
+    await checkQuota(uid, "generate");
+
     const { formData } = req.body;
 
     // 🔥 Strong prompt (forces structured JSON)
@@ -159,8 +224,7 @@ Challenge: ${formData.challenge}
     // ✅ SUCCESS
     return res.json(parsed);
 
-  } catch (err) {
-    console.error("SERVER ERROR:", err);
+  } catch (err) {    if (err.status === 429) return res.status(429).json({ error: err.message });    console.error("SERVER ERROR:", err);
     return res.status(500).json({
       error: "Server error",
       message: err.message
@@ -232,6 +296,14 @@ app.post("/verify-payment", paymentLimit, async (req, res) => {
 
 ///////////////////RESUME PARSING ENDPOINT////////////////////
 app.post("/parse-resume", aiLimit, async (req, res) => {
+  // ── Quota check ──
+  try {
+    const uid = await verifyToken(req);
+    await checkQuota(uid, "resumeCheck");
+  } catch (quotaErr) {
+    if (quotaErr.status === 429) return res.status(429).json({ error: quotaErr.message });
+  }
+
   const { resumeText, jobRole } = req.body;
  
   if (!resumeText || resumeText.length < 100) {
@@ -302,8 +374,7 @@ return res.json(data);
  
   } catch (err) {
     console.error("Resume analysis error:", err);
- 
-    // If JSON parse failed, return a helpful error
+    if (err.status === 429) return res.status(429).json({ error: err.message });
     if (err instanceof SyntaxError) {
       return res.status(500).json({ error: "AI returned invalid response. Try again." });
     }
@@ -314,6 +385,14 @@ return res.json(data);
 
 ////////////////Job Match Endpoint (SAME AS RESUME PARSE, JUST DIFFERENT PROMPT)////////////////////
 app.post("/job-match", aiLimit, async (req, res) => {
+  // ── Quota check ──
+  try {
+    const uid = await verifyToken(req);
+    await checkQuota(uid, "jobMatch");
+  } catch (quotaErr) {
+    if (quotaErr.status === 429) return res.status(429).json({ error: quotaErr.message });
+  }
+
   // FIX 1: Expect jobDescription instead of jobRole
   const { resumeText, jobDescription } = req.body;
 
@@ -393,6 +472,70 @@ ${resumeText.slice(0, 6000)}
       return res.status(500).json({ error: "AI returned invalid response format. Try again." });
     }
     return res.status(500).json({ error: "Analysis failed. Please try again." });
+  }
+});
+
+// ─── India Jobs — JSearch via RapidAPI (Pro only) ────────────────────────────
+const jobSearchLimit = rateLimit({ windowMs: 60_000, max: 30, message: { error: "Too many job search requests." } });
+
+app.get("/jobs/india", jobSearchLimit, async (req, res) => {
+  try {
+    // Must be signed in
+    const uid = await verifyToken(req);
+    if (!uid) return res.status(401).json({ error: "Sign in required to search India jobs." });
+
+    // Must be Pro — only enforced when Firestore Admin is available
+    if (adminDb) {
+      const snap = await adminDb.collection("users").doc(uid).get();
+      const data = snap.data() || {};
+      if (!data.plan || data.plan === "free") {
+        return res.status(403).json({ error: "Pro feature. Upgrade to access India job listings." });
+      }
+    }
+
+    const { query = "software developer", location = "India", page = "1" } = req.query;
+
+    if (!process.env.ADZUNA_APP_ID || !process.env.ADZUNA_APP_KEY) {
+      return res.status(500).json({ error: "Job search not configured on server." });
+    }
+
+    // Build Adzuna India search URL
+    const where = location === "Any" || location === "India" ? "" : location;
+    const url = new URL(`https://api.adzuna.com/v1/api/jobs/in/search/${page}`);
+    url.searchParams.set("app_id", process.env.ADZUNA_APP_ID);
+    url.searchParams.set("app_key", process.env.ADZUNA_APP_KEY);
+    url.searchParams.set("what", query || "software developer");
+    if (where) url.searchParams.set("where", where);
+    url.searchParams.set("results_per_page", "20");
+    url.searchParams.set("sort_by", "date");
+
+    const response = await fetch(url.toString());
+
+    if (!response.ok) {
+      const err = await response.text();
+      console.error("Adzuna error:", response.status, err);
+      return res.status(502).json({ error: "Job search service unavailable. Try again." });
+    }
+
+    const data = await response.json();
+
+    // Normalize to same shape as Remotive (what the frontend JobCard expects)
+    const jobs = (data.results || []).map((j) => ({
+      id: j.id,
+      title: j.title,
+      company_name: j.company?.display_name || "Unknown Company",
+      company_logo_url: null,
+      url: j.redirect_url,
+      publication_date: j.created,
+      candidate_required_location: j.location?.display_name || "India",
+      job_type: j.contract_type || j.contract_time || null,
+      tags: j.category?.label ? [j.category.label] : [],
+    }));
+
+    res.json({ jobs, total: data.count || 0 });
+  } catch (err) {
+    console.error("India jobs error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch jobs." });
   }
 });
 
