@@ -476,6 +476,21 @@ ${resumeText.slice(0, 6000)}
   }
 });
 
+// ─── In-memory cache ──────────────────────────────────────────────────────────
+const _cache = new Map();
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function getCached(key) {
+  const entry = _cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) { _cache.delete(key); return null; }
+  return entry.data;
+}
+
+function setCached(key, data) {
+  _cache.set(key, { data, ts: Date.now() });
+}
+
 // ─── India Jobs — JSearch via RapidAPI (Pro only) ────────────────────────────
 const jobSearchLimit = rateLimit({ windowMs: 60_000, max: 30, message: { error: "Too many job search requests." } });
 
@@ -502,6 +517,14 @@ app.get("/jobs/india", jobSearchLimit, async (req, res) => {
 
     // Build Adzuna India search URL
     const where = location === "Any" || location === "India" ? "" : location;
+
+    // ── Cache check ──────────────────────────────────────────────────────────
+    const cacheKey = `india:${query}:${where}:${page}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      return res.json({ ...cached, cached: true });
+    }
+
     const url = new URL(`https://api.adzuna.com/v1/api/jobs/in/search/${page}`);
     url.searchParams.set("app_id", process.env.ADZUNA_APP_ID);
     url.searchParams.set("app_key", process.env.ADZUNA_APP_KEY);
@@ -533,7 +556,9 @@ app.get("/jobs/india", jobSearchLimit, async (req, res) => {
       tags: j.category?.label ? [j.category.label] : [],
     }));
 
-    res.json({ jobs, total: data.count || 0 });
+    const result = { jobs, total: data.count || 0 };
+    setCached(cacheKey, result);
+    res.json(result);
   } catch (err) {
     console.error("India jobs error:", err);
     res.status(500).json({ error: err.message || "Failed to fetch jobs." });
