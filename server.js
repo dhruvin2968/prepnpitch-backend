@@ -7,6 +7,7 @@ import rateLimit from "express-rate-limit";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
@@ -18,6 +19,13 @@ try {
   adminDb = getFirestore();
 } catch (e) {
   console.warn("Firebase Admin not configured — Firestore upgrades disabled:", e.message);
+}
+
+// ─── Gemini client ────────────────────────────────────────────────────────────
+const _genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
+function getGemini() {
+  if (!_genAI) throw new Error("GEMINI_API_KEY not configured in environment.");
+  return _genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 }
 
 // ─── Free tier monthly quotas ──────────────────────────────────────────────────
@@ -584,6 +592,135 @@ app.get("/jobs/india", jobSearchLimit, async (req, res) => {
   } catch (err) {
     console.error("India jobs error:", err);
     res.status(500).json({ error: err.message || "Failed to fetch jobs." });
+  }
+});
+
+// ─── Mock Interview: Generate Questions ──────────────────────────────────────
+app.post("/mock-interview/start", aiLimit, async (req, res) => {
+  try {
+    const uid = await verifyToken(req);
+    if (uid) {
+      const cr = await checkAndDeductCredit(uid);
+      if (!cr.allowed) return res.status(403).json({ error: "No credits remaining. Upgrade to Pro for unlimited access.", code: "NO_CREDITS" });
+    }
+
+    const { role, level, techStack } = req.body;
+    if (!role || typeof role !== "string") return res.status(400).json({ error: "role is required." });
+
+    const safeRole  = sanitize(role);
+    const safeLevel = sanitize(level  || "Mid-level");
+    const safeTech  = sanitize(techStack || "");
+
+    // Q1 is always a fixed intro — no need to generate it
+    const introQuestion = "Tell me about yourself — walk me through your background, your experience level, your tech stack, and what you've been building recently.";
+
+    const prompt = `You are a senior technical interviewer at a top-tier tech company.
+Generate exactly 6 interview questions for a ${safeLevel}-level ${safeRole} position.${safeTech ? `\nThe candidate's tech stack includes: ${safeTech}.` : ""}
+
+Mix of questions:
+- 2 behavioral ("Tell me about a time…")
+- 3 technical (specific to the role and tech stack)
+- 1 system design (appropriate for ${safeLevel} level)
+
+Each question should be a single clear sentence. Do not number them.
+Return ONLY valid JSON — no markdown, no backticks, no explanation:
+{ "questions": ["<Q1>", "<Q2>", "<Q3>", "<Q4>", "<Q5>", "<Q6>"] }`;
+
+    const model = getGemini();
+    const result = await model.generateContent(prompt);
+    const raw  = result.response.text().replace(/```json|```/g, "").trim();
+    const data = JSON.parse(raw);
+
+    if (!Array.isArray(data.questions) || data.questions.length < 4) {
+      return res.status(500).json({ error: "AI returned an invalid format. Please try again." });
+    }
+
+    return res.json({ questions: [introQuestion, ...data.questions] });
+  } catch (err) {
+    console.error("mock-interview/start error:", err);
+    return res.status(500).json({ error: "Failed to generate questions. Try again." });
+  }
+});
+
+// ─── Mock Interview: Evaluate a Single Answer ────────────────────────────────
+app.post("/mock-interview/evaluate", aiLimit, async (req, res) => {
+  try {
+    const { question, answer, role, level } = req.body;
+    if (!question || !answer) return res.status(400).json({ error: "question and answer are required." });
+    if (answer.trim().length < 10) return res.status(400).json({ error: "Answer is too short." });
+
+    const prompt = `You are strictly evaluating a mock interview answer.
+Role: ${sanitize(level || "Mid-level")}-level ${sanitize(role || "Software Engineer")}
+Question: "${sanitize(question)}"
+Candidate's Answer: "${sanitize(answer)}"
+
+Score harshly — a vague, rambling, or incomplete answer must not exceed 5.
+Return ONLY valid JSON — no markdown, no backticks:
+{
+  "score": <integer 0-10>,
+  "verdict": "<one of exactly: Strong | Good | Average | Weak>",
+  "feedback": "<2-3 sentences: what was correct, what was missing or weak>",
+  "tip": "<one specific, actionable thing to add or improve next time>"
+}`;
+
+    const model = getGemini();
+    const result = await model.generateContent(prompt);
+    const raw  = result.response.text().replace(/```json|```/g, "").trim();
+    const data = JSON.parse(raw);
+
+    return res.json(data);
+  } catch (err) {
+    console.error("mock-interview/evaluate error:", err);
+    return res.status(500).json({ error: "Evaluation failed. Try again." });
+  }
+});
+
+// ─── Mock Interview: Final Report ────────────────────────────────────────────
+app.post("/mock-interview/report", aiLimit, async (req, res) => {
+  try {
+    const { role, level, qa } = req.body;
+    if (!Array.isArray(qa) || qa.length < 3) {
+      return res.status(400).json({ error: "Need at least 3 answered questions for a report." });
+    }
+
+    const qaSummary = qa.map((item, i) =>
+      `Q${i + 1}: ${sanitize(item.q)}\nAnswer: ${sanitize(item.a)}`
+    ).join("\n\n");
+
+    const prompt = `You are a senior technical interviewer debriefing a mock interview.
+Role: ${sanitize(level || "Mid-level")}-level ${sanitize(role || "Software Engineer")}
+
+Interview Q&A (answers given by the candidate):
+${qaSummary}
+
+Return ONLY valid JSON — no markdown, no backticks:
+{
+  "overallScore": <integer 0-100>,
+  "grade": "<one of exactly: A+ | A | B+ | B | C+ | C | D>",
+  "summary": "<3 sentences: honest overall assessment of performance>",
+  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
+  "improvements": ["<improvement area 1>", "<improvement area 2>", "<improvement area 3>"],
+  "studyTopics": [
+    { "topic": "<topic to study>", "reason": "<why this matters for the role>" },
+    { "topic": "<topic>", "reason": "<why>" },
+    { "topic": "<topic>", "reason": "<why>" }
+  ],
+  "breakdown": [
+    { "score": <0-10>, "verdict": "<Strong|Good|Average|Weak>", "feedback": "<2 sentences: what was good and what was weak>", "tip": "<one specific improvement>" }
+  ]
+}
+
+The breakdown array must have exactly ${qa.length} entries, one per question in order. Score harshly — vague or short answers must not exceed 5.`;
+
+    const model = getGemini();
+    const result = await model.generateContent(prompt);
+    const raw  = result.response.text().replace(/```json|```/g, "").trim();
+    const data = JSON.parse(raw);
+
+    return res.json(data);
+  } catch (err) {
+    console.error("mock-interview/report error:", err);
+    return res.status(500).json({ error: "Report generation failed. Try again." });
   }
 });
 
