@@ -2,8 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import Razorpay from "razorpay";
 import rateLimit from "express-rate-limit";
+import nodemailer from "nodemailer";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
@@ -257,14 +257,48 @@ Rules:
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-function getRazorpay() {
-  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
-    throw new Error("Razorpay keys not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env");
+function getCashfreeBase() {
+  return (process.env.CASHFREE_ENV || "sandbox") === "production"
+    ? "https://api.cashfree.com"
+    : "https://sandbox.cashfree.com";
+}
+
+function cashfreeHeaders() {
+  if (!process.env.CASHFREE_APP_ID || !process.env.CASHFREE_SECRET_KEY) {
+    throw new Error("Cashfree keys not configured. Add CASHFREE_APP_ID and CASHFREE_SECRET_KEY to .env");
   }
-  return new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  return {
+    "Content-Type": "application/json",
+    "x-api-version": "2023-08-01",
+    "x-client-id": process.env.CASHFREE_APP_ID,
+    "x-client-secret": process.env.CASHFREE_SECRET_KEY,
+  };
+}
+
+async function cashfreeCreateOrder({ orderId, amountPaise, customerName, customerEmail }) {
+  const res = await fetch(`${getCashfreeBase()}/pg/orders`, {
+    method: "POST",
+    headers: cashfreeHeaders(),
+    body: JSON.stringify({
+      order_id: orderId,
+      order_amount: (amountPaise / 100).toFixed(2),
+      order_currency: "INR",
+      customer_details: {
+        customer_id: orderId,
+        customer_name: customerName || "Customer",
+        customer_email: customerEmail || "customer@prepnpitch.com",
+        customer_phone: "9999999999",
+      },
+    }),
   });
+  return res.json();
+}
+
+async function cashfreeVerifyOrder(orderId) {
+  const res = await fetch(`${getCashfreeBase()}/pg/orders/${encodeURIComponent(orderId)}`, {
+    headers: cashfreeHeaders(),
+  });
+  return res.json();
 }
 
 app.post("/create-order", paymentLimit, async (req, res) => {
@@ -273,31 +307,29 @@ app.post("/create-order", paymentLimit, async (req, res) => {
     if (!amount || typeof amount !== "number" || amount < 100) {
       return res.status(400).json({ error: "Invalid amount." });
     }
-    const order = await getRazorpay().orders.create({
-      amount,
-      currency: "INR",
-      receipt: `order_${planId}_${Date.now()}`,
-    });
-    res.json(order);
+    const orderId = `order_${planId}_${Date.now()}`;
+    const order = await cashfreeCreateOrder({ orderId, amountPaise: amount });
+    if (order.message) return res.status(400).json({ error: order.message });
+    res.json({ order_id: order.order_id, payment_session_id: order.payment_session_id, amount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post("/verify-payment", paymentLimit, async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, uid } = req.body;
+  const { order_id, planId, uid } = req.body;
 
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-    return res.status(400).json({ success: false, error: "Missing payment fields." });
+  if (!order_id) {
+    return res.status(400).json({ success: false, error: "Missing order_id." });
   }
 
-  const expectedSignature = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-    .digest("hex");
-
-  if (expectedSignature !== razorpay_signature) {
-    return res.status(400).json({ success: false, error: "Payment verification failed." });
+  try {
+    const order = await cashfreeVerifyOrder(order_id);
+    if (order.order_status !== "PAID") {
+      return res.status(400).json({ success: false, error: "Payment not completed." });
+    }
+  } catch (err) {
+    return res.status(500).json({ success: false, error: "Could not verify payment." });
   }
 
   // Upgrade user in Firestore if Admin SDK is available
@@ -310,7 +342,6 @@ app.post("/verify-payment", paymentLimit, async (req, res) => {
       });
     } catch (err) {
       console.error("Firestore upgrade failed:", err.message);
-      // Payment is verified — don't fail the response, but log it
     }
   }
 
@@ -723,6 +754,138 @@ The breakdown array must have exactly ${qa.length} entries, one per question in 
     return res.status(500).json({ error: "Report generation failed. Try again." });
   }
 });
+
+// ─── Email notifier ──────────────────────────────────────────────────────────
+function createMailer() {
+  if (!process.env.NOTIFY_EMAIL || !process.env.NOTIFY_EMAIL_PASS) return null;
+  return nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: process.env.NOTIFY_EMAIL, pass: process.env.NOTIFY_EMAIL_PASS },
+  });
+}
+
+// ─── Booking slots ────────────────────────────────────────────────────────────
+const SLOTS = ["19:00–20:00", "22:00–23:00"]; // 7–8 PM and 10–11 PM IST
+
+// GET /booking/slots?date=YYYY-MM-DD
+app.get("/booking/slots", async (req, res) => {
+  const { date } = req.query;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "Invalid date format. Use YYYY-MM-DD." });
+  }
+  if (!adminDb) return res.json({ slots: SLOTS.map(s => ({ slot: s, available: true })) });
+  try {
+    const snap = await adminDb.collection("bookings")
+      .where("date", "==", date)
+      .get();
+    const booked = new Set(
+      snap.docs.filter(d => d.data().status !== "cancelled").map(d => d.data().slot)
+    );
+    res.json({ slots: SLOTS.map(s => ({ slot: s, available: !booked.has(s) })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /booking/create-order
+app.post("/booking/create-order", paymentLimit, async (req, res) => {
+  const { date, slot, name, email, role, level } = req.body;
+  if (!date || !slot || !name || !email) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+  if (!SLOTS.includes(slot)) return res.status(400).json({ error: "Invalid slot." });
+
+  // Check slot is still available
+  if (adminDb) {
+    const snap = await adminDb.collection("bookings")
+      .where("date", "==", date).where("slot", "==", slot)
+      .get();
+    const active = snap.docs.filter(d => d.data().status !== "cancelled");
+    if (active.length > 0) return res.status(409).json({ error: "This slot was just taken. Please choose another." });
+  }
+
+  try {
+    const orderId = `booking_${Date.now()}`;
+    const order = await cashfreeCreateOrder({
+      orderId,
+      amountPaise: 14900,
+      customerName: name,
+      customerEmail: email,
+    });
+    if (order.message) return res.status(400).json({ error: order.message });
+    res.json({ order_id: order.order_id, payment_session_id: order.payment_session_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /booking/confirm
+app.post("/booking/confirm", paymentLimit, async (req, res) => {
+  const { order_id, date, slot, name, email, role, level, uid } = req.body;
+
+  if (!order_id) {
+    return res.status(400).json({ error: "Missing order_id." });
+  }
+
+  // Verify payment via Cashfree API
+  try {
+    const order = await cashfreeVerifyOrder(order_id);
+    if (order.order_status !== "PAID") {
+      return res.status(400).json({ error: "Payment not completed." });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: "Could not verify payment." });
+  }
+
+  // Save booking to Firestore
+  let bookingId = null;
+  if (adminDb) {
+    try {
+      const ref = await adminDb.collection("bookings").add({
+        date, slot, name, email,
+        role: role || "",
+        level: level || "",
+        uid: uid || null,
+        cashfreeOrderId: order_id,
+        status: "confirmed",
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      bookingId = ref.id;
+    } catch (err) {
+      console.error("Booking Firestore save failed:", err.message);
+    }
+  }
+
+  // Send email notification to owner
+  const mailer = createMailer();
+  if (mailer) {
+    const slotLabel = slot === "19:00–20:00" ? "7:00 – 8:00 PM IST" : "10:00 – 11:00 PM IST";
+    mailer.sendMail({
+      from: `"PrepNPitch Bookings" <${process.env.NOTIFY_EMAIL}>`,
+      to: process.env.NOTIFY_EMAIL,
+      subject: `New Interview Booking — ${name} on ${date}`,
+      html: `
+        <h2 style="font-family:sans-serif">New Interview Session Booked 🎉</h2>
+        <table style="font-family:sans-serif;font-size:15px;border-collapse:collapse">
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Name</td><td><b>${name}</b></td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Email</td><td>${email}</td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Date</td><td>${date}</td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Slot</td><td>${slotLabel}</td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Role</td><td>${role || "—"}</td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Level</td><td>${level || "—"}</td></tr>
+          <tr><td style="padding:6px 16px 6px 0;color:#888">Order ID</td><td style="font-size:12px;color:#555">${order_id}</td></tr>
+          ${bookingId ? `<tr><td style="padding:6px 16px 6px 0;color:#888">Booking ID</td><td style="font-size:12px;color:#555">${bookingId}</td></tr>` : ""}
+        </table>
+        <p style="font-family:sans-serif;color:#888;font-size:13px;margin-top:24px">Reply to this email to send the Meet link to the candidate.</p>
+      `,
+      replyTo: email,
+    }).catch(err => console.error("Email send failed:", err.message));
+  }
+
+  res.json({ success: true, bookingId });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
