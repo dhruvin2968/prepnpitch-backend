@@ -626,7 +626,6 @@ app.get("/jobs/india", jobSearchLimit, async (req, res) => {
   }
 });
 
-<<<<<<< HEAD
 // ─── Mock Interview: Generate Questions ──────────────────────────────────────
 app.post("/mock-interview/start", aiLimit, async (req, res) => {
   try {
