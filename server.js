@@ -393,7 +393,7 @@ The JSON must follow this exact shape:
 }
  
 Scoring guide:
-- atsScore: How well will this pass ATS filters? Check for standard section headers, no tables/columns, parseable format.
+- atsScore: How well will this pass ATS filters? Check for standard section headers, no tables/columns, parseable format. Keep a bit more only like if you are giving 80.. give +6= 86.. if 85 then give 91. until it reaches 93 and ofcourse should never cross 100.
 - keywordScore: Does it contain relevant technical and domain keywords for the role?
 - impactScore: Do bullet points quantify achievements? Avoid "responsible for", "worked on", "helped with".
 - formatScore: Is length appropriate (1 page for <5 yrs exp), consistent formatting, no fluff?
