@@ -626,6 +626,7 @@ app.get("/jobs/india", jobSearchLimit, async (req, res) => {
   }
 });
 
+<<<<<<< HEAD
 // ─── Mock Interview: Generate Questions ──────────────────────────────────────
 app.post("/mock-interview/start", aiLimit, async (req, res) => {
   try {
@@ -886,6 +887,10 @@ app.post("/booking/confirm", paymentLimit, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
