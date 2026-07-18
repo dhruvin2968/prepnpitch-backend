@@ -892,6 +892,18 @@ app.get("/health", (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+// Keep-alive self ping every 13 minutes
+setInterval(async () => {
+  try {
+    const response = await fetch("https://prepnpitch-backend.onrender.com/health");
+
+    console.log(
+      `[SELF PING] ${new Date().toISOString()} - ${response.status} ${response.statusText}`
+    );
+  } catch (err) {
+    console.error(`[SELF PING] Failed: ${err.message}`);
+  }
+}, 13 * 60 * 1000);
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
